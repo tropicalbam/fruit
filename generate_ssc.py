@@ -4,6 +4,8 @@ import librosa
 import joblib
 from sklearn.neural_network import MLPRegressor
 import traceback
+import random
+import math
 
 # Path to the trained model
 model_path = r'D:\DDRAI\trained_model.joblib'
@@ -38,19 +40,19 @@ def extract_features(audio_file):
         
         # Extract features
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-        mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
+        mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=7)  # Reduce to 7 MFCCs
         chroma = librosa.feature.chroma_stft(y=y, sr=sr)
         
         # Create a dictionary of features
-        features = {
-            'tempo': tempo,
-            'mfccs_mean': np.mean(mfccs, axis=1),
-            'mfccs_var': np.var(mfccs, axis=1),
-            'chroma_mean': np.mean(chroma, axis=1),
-            'chroma_var': np.var(chroma, axis=1)
-        }
+        features = np.concatenate([
+            np.array([tempo]).reshape(1, -1),
+            np.mean(mfccs, axis=1).reshape(1, -1),
+            np.mean(chroma, axis=1).reshape(1, -1)
+        ], axis=1)
         
-        print(f"Extracted features: {list(features.keys())}")
+        features = features.flatten()  # Flatten the array to 1D
+        
+        print(f"Extracted features shape: {features.shape}")
         return features, tempo, duration
     except Exception as e:
         print(f"Failed to extract features from {audio_file}: {e}")
@@ -59,23 +61,12 @@ def extract_features(audio_file):
 
 def predict_notes(model, features, duration, tempo):
     try:
-        # Flatten and combine all features
-        feature_vector = np.concatenate([
-            [features['tempo']],
-            features['mfccs_mean'],
-            features['mfccs_var'],
-            features['chroma_mean'],
-            features['chroma_var']
-        ])
-        
-        # Reshape features to match the model's expected input
-        features_reshaped = feature_vector.reshape(1, -1)
+        features_reshaped = features.reshape(1, -1)
         print(f"Reshaped features shape: {features_reshaped.shape}")
         print(f"Model's expected input shape: {model.n_features_in_}")
         
         if features_reshaped.shape[1] != model.n_features_in_:
             print(f"Warning: Number of features ({features_reshaped.shape[1]}) doesn't match model's expected input ({model.n_features_in_})")
-            # Pad or truncate features to match model's expected input
             if features_reshaped.shape[1] < model.n_features_in_:
                 features_reshaped = np.pad(features_reshaped, ((0, 0), (0, model.n_features_in_ - features_reshaped.shape[1])))
             else:
@@ -84,56 +75,95 @@ def predict_notes(model, features, duration, tempo):
         # Predict notes
         raw_predictions = model.predict(features_reshaped)
         
+        # Ensure raw_predictions is a 1D array
+        raw_predictions = raw_predictions.flatten()
+        
         # Calculate number of steps based on duration and tempo
-        steps = int(duration * tempo / 60)
+        steps = int(duration * tempo / 60 * 4)  # Assuming 4 beats per measure
         
-        # Ensure we have the correct number of predictions
-        if len(raw_predictions) < steps:
-            raw_predictions = np.pad(raw_predictions, (0, steps - len(raw_predictions)))
-        elif len(raw_predictions) > steps:
-            raw_predictions = raw_predictions[:steps]
+        # Interpolate predictions to match the number of steps
+        predicted_notes = np.interp(np.linspace(0, len(raw_predictions) - 1, steps), 
+                                    np.arange(len(raw_predictions)), 
+                                    raw_predictions)
         
-        return raw_predictions
+        return predicted_notes
     except Exception as e:
         print(f"Error in predicting notes: {e}")
         traceback.print_exc()
         return None
 
-def map_to_ddr_note(step_values):
-    # Ensure we only have one or two arrows pressed at a time
-    active_arrows = np.argsort(step_values)[-2:]  # Get indices of the two highest values
-    mapped_step = ['0'] * 4
-    for i in active_arrows:
-        if step_values[i] > 0.5:  # Only activate if the value is high enough
-            mapped_step[i] = '1'
-    return ''.join(mapped_step)
-
-def format_notes(predicted_notes, difficulty, beats_per_measure=16):
+def format_notes(predicted_notes, difficulty, tempo, duration):
+    note_densities = {'Beginner': 0.25, 'Easy': 0.5, 'Medium': 0.75}
+    note_density = note_densities[difficulty]
     formatted_notes = ""
-    for i in range(0, len(predicted_notes), beats_per_measure):
-        measure = predicted_notes[i:i+beats_per_measure]
-        mapped_measure = [map_to_ddr_note(step) for step in measure]
-        
-        # Adjust difficulty
-        if difficulty == 'Beginner':
-            mapped_measure = ['0000' if j % 4 != 0 else step for j, step in enumerate(mapped_measure)]
-        elif difficulty == 'Easy':
-            mapped_measure = ['0000' if j % 2 != 0 else step for j, step in enumerate(mapped_measure)]
-        
-        formatted_notes += "\n".join(mapped_measure) + "\n,  \n"
+    
+    beats_per_second = tempo / 60
+    total_beats = int(duration * beats_per_second)
+    total_measures = math.floor(total_beats / 4)  # Assuming 4/4 time signature
+    
+    intro_measures = 4
+    outro_measures = 2
+    main_measures = total_measures - intro_measures - outro_measures
+
+    # Simple patterns for each difficulty
+    patterns = {
+        'Beginner': [
+            ['1000', '0000', '0000', '0000'],
+            ['0100', '0000', '0000', '0000'],
+            ['0010', '0000', '0000', '0000'],
+            ['0001', '0000', '0000', '0000']
+        ],
+        'Easy': [
+            ['1000', '0000', '0100', '0000'],
+            ['0010', '0000', '0001', '0000'],
+            ['1000', '0000', '0001', '0000'],
+            ['0100', '0000', '0010', '0000']
+        ],
+        'Medium': [
+            ['1000', '0100', '0010', '0001'],
+            ['1000', '0001', '0100', '0010'],
+            ['0100', '0010', '1000', '0001'],
+            ['0010', '0001', '1000', '0100']
+        ]
+    }
+
+    # Add intro measures
+    for _ in range(intro_measures):
+        formatted_notes += "0000\n0000\n0000\n0000\n,\n"
+
+    # Generate notes for the main part of the song
+    note_index = 0
+    for _ in range(main_measures):
+        if random.random() < note_density:
+            pattern = random.choice(patterns[difficulty])
+            formatted_notes += "\n".join(pattern) + "\n,\n"
+        else:
+            formatted_notes += "0000\n0000\n0000\n0000\n,\n"
+        note_index += 4
+
+    # Add outro measures
+    for _ in range(outro_measures):
+        formatted_notes += "0000\n0000\n0000\n0000\n,\n"
+
     return formatted_notes.strip()
 
 def generate_ssc_from_chart(audio_file, predicted_notes, tempo, duration):
-    difficulties = ['Beginner', 'Easy', 'Medium', 'Hard', 'Challenge']
+    difficulties = [
+        ('Beginner', 1),
+        ('Easy', 2),
+        ('Medium', 4)
+    ]
+    
+    # Round the tempo to the nearest whole number and convert to int
+    rounded_tempo = int(np.round(tempo))
+    
     ssc_template = f"""#VERSION:0.83;
 #TITLE:Generated by StepGPT;
 #ARTIST:StepGPT;
 #MUSIC:{os.path.basename(audio_file)};
 #OFFSET:0.009;
-#SAMPLESTART:54.548077;
-#SAMPLELENGTH:11.550000;
 #SELECTABLE:YES;
-#BPMS:0.000={tempo};
+#BPMS:0.000={rounded_tempo}.000;
 #STOPS:;
 #DELAYS:;
 #WARPS:;
@@ -150,9 +180,8 @@ def generate_ssc_from_chart(audio_file, predicted_notes, tempo, duration):
 ;
 """
 
-    for difficulty in difficulties:
-        meter = {'Beginner': 1, 'Easy': 4, 'Medium': 7, 'Hard': 9, 'Challenge': 12}[difficulty]
-        formatted_notes = format_notes(predicted_notes, difficulty)
+    for difficulty, meter in difficulties:
+        formatted_notes = format_notes(predicted_notes, difficulty, rounded_tempo, duration)
         ssc_template += f"""#NOTEDATA:;
 #CHARTNAME:StepGPT Chart;
 #STEPSTYPE:dance-single;
@@ -160,7 +189,6 @@ def generate_ssc_from_chart(audio_file, predicted_notes, tempo, duration):
 #CHARTSTYLE:;
 #DIFFICULTY:{difficulty};
 #METER:{meter};
-#RADARVALUES:0.491635,0.531859,0.000000,0.231747,0.034762,297.000000,297.000000,0.000000,20.000000,0.000000,0.000000,0.000000,0.000000,0.000000,0.491635,0.531859,0.000000,0.231747,0.034762,297.000000,297.000000,0.000000,20.000000,0.000000,0.000000,0.000000,0.000000,0.000000;
 #CREDIT:StepGPT;
 #NOTES:
 {formatted_notes}
@@ -181,36 +209,37 @@ def generate_ssc_from_chart(audio_file, predicted_notes, tempo, duration):
         print(f"Failed to write SSC file for {audio_file}: {e}")
 
 # Main execution
-# Get list of all OGG files in the audio_files_directory
-try:
-    print(f"Listing files in directory: {audio_files_directory}")
-    all_files = os.listdir(audio_files_directory)
-    print(f"All files: {all_files}")
-    test_audio_files = [os.path.join(audio_files_directory, f) for f in all_files if f.lower().endswith('.ogg')]
-    print(f"Found {len(test_audio_files)} audio files.")
-except Exception as e:
-    print(f"Failed to list audio files: {e}")
-    exit(1)
-
-# Loop through the test files and generate SSC files
-for audio_file in test_audio_files:
+if __name__ == "__main__":
+    # Get list of all OGG files in the audio_files_directory
     try:
-        if not os.path.exists(audio_file):
-            print(f"Error: Audio file {audio_file} does not exist.")
-            continue
-        
-        print(f"Processing {audio_file}...")
-        features, tempo, duration = extract_features(audio_file)
-        if features is not None:
-            predicted_notes = predict_notes(model, features, duration, tempo)
-            if predicted_notes is not None:
-                generate_ssc_from_chart(audio_file, predicted_notes, tempo, duration)
-            else:
-                print(f"Skipping {audio_file} due to failed note prediction.")
-        else:
-            print(f"Skipping {audio_file} due to failed feature extraction.")
+        print(f"Listing files in directory: {audio_files_directory}")
+        all_files = os.listdir(audio_files_directory)
+        print(f"All files: {all_files}")
+        test_audio_files = [os.path.join(audio_files_directory, f) for f in all_files if f.lower().endswith('.ogg')]
+        print(f"Found {len(test_audio_files)} audio files.")
     except Exception as e:
-        print(f"Failed to process {audio_file}: {e}")
-        traceback.print_exc()
+        print(f"Failed to list audio files: {e}")
+        exit(1)
 
-print("Processing complete.")
+    # Loop through the test files and generate SSC files
+    for audio_file in test_audio_files:
+        try:
+            if not os.path.exists(audio_file):
+                print(f"Error: Audio file {audio_file} does not exist.")
+                continue
+            
+            print(f"Processing {audio_file}...")
+            features, tempo, duration = extract_features(audio_file)
+            if features is not None:
+                predicted_notes = predict_notes(model, features, duration, tempo)
+                if predicted_notes is not None:
+                    generate_ssc_from_chart(audio_file, predicted_notes, tempo, duration)
+                else:
+                    print(f"Skipping {audio_file} due to failed note prediction.")
+            else:
+                print(f"Skipping {audio_file} due to failed feature extraction.")
+        except Exception as e:
+            print(f"Failed to process {audio_file}: {e}")
+            traceback.print_exc()
+
+    print("Processing complete.")
